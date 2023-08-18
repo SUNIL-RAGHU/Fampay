@@ -12,6 +12,7 @@ import (
 	_ "github.com/jinzhu/gorm/dialects/sqlite"
 	"google.golang.org/api/option"
 	"google.golang.org/api/youtube/v3"
+	
 )
 
 type Video struct {
@@ -21,6 +22,9 @@ type Video struct {
 	PublishedAt   time.Time `gorm:"index;not null"`
 	ThumbnailsURL string
 }
+
+var fetchedVideoIDs = make(map[string]bool)
+var mutex = &sync.Mutex{}
 
 func main() {
 	router := gin.Default()
@@ -32,7 +36,7 @@ func main() {
 
 	db.AutoMigrate(&Video{})
 
-	apiKey := "AIzaSyAFhqbTappRTD1pJ36xDkJEFJuYuQJ8GGA"
+	apiKey := "YOUR_API_KEY_HERE"
 
 	client := &http.Client{}
 	service, err := youtube.NewService(client, option.WithAPIKey(apiKey))
@@ -40,19 +44,16 @@ func main() {
 		log.Fatalf("Error creating YouTube service: %v", err)
 	}
 
-	searchQuery := "Anime"
+	searchQuery := "Cricket"
 
 	var wg sync.WaitGroup
 	videoChannel := make(chan Video)
-
-	go fetchVideos(service, searchQuery, videoChannel, &wg, db)
-
-	// Start the Gin server
-	go func() {
+    go fetchVideos(service, searchQuery, videoChannel, &wg, db)
+    go func() {
 		router.GET("/videos", func(c *gin.Context) {
 			var videos []Video
 			db.Order("published_at DESC").Find(&videos)
-            
+
 			page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
 			perPage := 10
 			startIdx := (page - 1) * perPage
@@ -68,7 +69,8 @@ func main() {
 		router.Run(":8000")
 	}()
 
-	
+	go clearFetchedVideoIDs()
+
 	for {
 		time.Sleep(10 * time.Second)
 		go fetchVideos(service, searchQuery, videoChannel, &wg, db)
@@ -80,7 +82,15 @@ func fetchVideos(service *youtube.Service, searchQuery string, videoChannel chan
 	defer wg.Done()
 	wg.Add(1)
 
-	call := service.Search.List([]string{"snippet"}).Q(searchQuery).Type("video").Order("date").MaxResults(10)
+
+	publishedAfter := time.Now().Add(-24 * time.Hour)
+
+	call := service.Search.List([]string{"snippet"}).
+		Q(searchQuery).
+		Type("video").
+		Order("date").
+		PublishedAfter(publishedAfter.Format(time.RFC3339)).
+		MaxResults(10)
 
 	response, err := call.Do()
 	if err != nil {
@@ -89,16 +99,33 @@ func fetchVideos(service *youtube.Service, searchQuery string, videoChannel chan
 	}
 
 	for _, item := range response.Items {
-		publishDatetime, _ := time.Parse(time.RFC3339, item.Snippet.PublishedAt)
-		video := Video{
-			Title:         item.Snippet.Title,
-			Description:   item.Snippet.Description,
-			PublishedAt:   publishDatetime,
-			ThumbnailsURL: item.Snippet.Thumbnails.Default.Url,
-		
-		}
-		db.Create(&video)
+		mutex.Lock()
+		if !fetchedVideoIDs[item.Id.VideoId] {
+			fetchedVideoIDs[item.Id.VideoId] = true
+			mutex.Unlock()
 
-		videoChannel <- video
+			publishDatetime, _ := time.Parse(time.RFC3339, item.Snippet.PublishedAt)
+			video := Video{
+				Title:         item.Snippet.Title,
+				Description:   item.Snippet.Description,
+				PublishedAt:   publishDatetime,
+				ThumbnailsURL: item.Snippet.Thumbnails.Default.Url,
+			}
+			db.Create(&video)
+
+			videoChannel <- video
+		} else {
+			mutex.Unlock()
+		}
 	}
 }
+
+func clearFetchedVideoIDs() {
+	for {
+		time.Sleep(time.Hour)
+		mutex.Lock()
+		fetchedVideoIDs = make(map[string]bool)
+		mutex.Unlock()
+	}
+}
+
